@@ -73,7 +73,8 @@ Reply http_get(const std::string &url, const std::string &authorization = "") {
 	return r;
 }
 
-Reply http_post(const std::string &url, const std::string &body, const std::string &request_id) {
+Reply http_post(const std::string &url, const std::string &body, const std::string &request_id,
+		const std::string &authorization) {
 	Reply r;
 	CURL *c = curl_easy_init();
 	if (!c) {
@@ -83,6 +84,10 @@ Reply http_post(const std::string &url, const std::string &body, const std::stri
 	h = curl_slist_append(h, "Content-Type: application/json");
 	const std::string rid = "X-Request-ID: " + request_id;
 	h = curl_slist_append(h, rid.c_str());
+	if (!authorization.empty()) {
+		const std::string a = "Authorization: " + authorization;
+		h = curl_slist_append(h, a.c_str());
+	}
 	curl_easy_setopt(c, CURLOPT_URL, url.c_str());
 	curl_easy_setopt(c, CURLOPT_HTTPHEADER, h);
 	curl_easy_setopt(c, CURLOPT_POSTFIELDS, body.c_str());
@@ -166,6 +171,11 @@ int main() {
 	curl_global_init(CURL_GLOBAL_DEFAULT);
 
 	const std::string worker = env("RUNPOD_POD_ID", "local");
+	// Every call a worker makes carries this, not just the ping: the Python SDK
+	// puts it on the session (`http_client.get_auth_header`), so job-take and the
+	// result post are authenticated too. A job-take without it is answered as
+	// though there were no work, which is indistinguishable from an idle queue.
+	const std::string api_key = env("RUNPOD_AI_API_KEY");
 	const std::string take = subst(env("RUNPOD_WEBHOOK_GET_JOB"), "$ID", worker);
 	const std::string done_tpl = subst(env("RUNPOD_WEBHOOK_POST_OUTPUT"), "$RUNPOD_POD_ID", worker);
 
@@ -182,7 +192,6 @@ int main() {
 	// to be alive by the job it has not taken yet is indistinguishable from one
 	// that has hung, and this is the only call that says otherwise.
 	const std::string ping = subst(env("RUNPOD_WEBHOOK_PING"), "$RUNPOD_POD_ID", worker);
-	const std::string api_key = env("RUNPOD_AI_API_KEY");
 	const long ping_ms = atol(env("RUNPOD_PING_INTERVAL", "10000").c_str());
 	std::thread heartbeat;
 	if (!ping.empty()) {
@@ -203,7 +212,7 @@ int main() {
 	}
 
 	for (;;) {
-		const Reply job = http_get(take + "&job_in_progress=0");
+		const Reply job = http_get(take + "&job_in_progress=0", api_key);
 
 		// 204 is "no job" and 400 is the same answer when FlashBoot is on.
 		// Neither is a failure, and a worker that logged them as one would fill
@@ -239,7 +248,7 @@ int main() {
 				"\",\"echo\":" + (input.empty() ? "null" : input) + "}";
 
 		const std::string done = subst(done_tpl, "$ID", id) + "&isStream=false";
-		const Reply posted = http_post(done, "{\"output\":" + output + "}", id);
+		const Reply posted = http_post(done, "{\"output\":" + output + "}", id, api_key);
 		fprintf(stderr, "worker: posted %s -> %ld\n", id.c_str(), posted.status);
 	}
 }
