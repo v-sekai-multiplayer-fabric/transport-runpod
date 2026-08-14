@@ -17,6 +17,8 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <ctime>
 #include <string>
 #include <thread>
 
@@ -25,6 +27,84 @@ namespace {
 std::string env(const char *k, const char *fallback = "") {
 	const char *v = getenv(k);
 	return v ? v : fallback;
+}
+
+// ── The log ───────────────────────────────────────────────────────────────────
+//
+// RunPod shows worker logs only in its web console: there is no logs path in the
+// REST API (checked against /v1/openapi.json, 23 paths) and GraphQL has no
+// `workers` field on Endpoint. A serverless worker also has no inbound HTTP, so
+// it cannot serve its own records the way a pod can.
+//
+// So it writes them to the network volume instead, and something with a proxy
+// hostname reads them from there. Same OTel NDJSON record shape as
+// `interactor-seethrough-ggml`'s `entrypoint.sh`, so one reader serves both.
+//
+// stderr keeps every line too: when the console *is* reachable that is still the
+// first place anyone looks, and a log that exists in only one place is a log that
+// is missing whenever that place is the unreachable one.
+const char *LOGF = nullptr;
+
+int severity_number(const char *sev) {
+	if (!strcmp(sev, "DEBUG")) return 5;
+	if (!strcmp(sev, "INFO")) return 9;
+	if (!strcmp(sev, "WARN")) return 13;
+	if (!strcmp(sev, "ERROR")) return 17;
+	if (!strcmp(sev, "FATAL")) return 21;
+	return 0;
+}
+
+std::string json_escape(const std::string &s) {
+	std::string o;
+	for (char ch : s) {
+		switch (ch) {
+		case '"': o += "\\\""; break;
+		case '\\': o += "\\\\"; break;
+		case '\n': o += "\\n"; break;
+		case '\r': o += "\\r"; break;
+		case '\t': o += "\\t"; break;
+		default:
+			if ((unsigned char)ch < 0x20) {
+				char b[8];
+				snprintf(b, sizeof b, "\\u%04x", ch);
+				o += b;
+			} else {
+				o += ch;
+			}
+		}
+	}
+	return o;
+}
+
+void emit(const char *sev, const std::string &body, const std::string &event = "") {
+	fprintf(stderr, "worker: %s\n", body.c_str());
+	fflush(stderr);
+	if (!LOGF) {
+		return;
+	}
+	// Opened and closed per record, and flushed: a worker that is killed between
+	// jobs still leaves every line it wrote, which is the whole point of writing
+	// them somewhere durable.
+	FILE *f = fopen(LOGF, "a");
+	if (!f) {
+		return;
+	}
+	char ts[64];
+	const time_t now = time(nullptr);
+	struct tm tmv;
+#ifdef _WIN32
+	gmtime_s(&tmv, &now);
+#else
+	gmtime_r(&now, &tmv);
+#endif
+	strftime(ts, sizeof ts, "%Y-%m-%dT%H:%M:%SZ", &tmv);
+	fprintf(f,
+			"{\"Timestamp\":\"%s\",\"SeverityText\":\"%s\",\"SeverityNumber\":%d,"
+			"\"Body\":\"%s\",\"Attributes\":{\"event.name\":\"%s\"},"
+			"\"Resource\":{\"service.name\":\"transport-runpod\",\"runpod.pod.id\":\"%s\"}}\n",
+			ts, sev, severity_number(sev), json_escape(body).c_str(),
+			json_escape(event).c_str(), env("RUNPOD_POD_ID", "unknown").c_str());
+	fclose(f);
 }
 
 // `$ID` means the worker id in the job-take URL and the *job* id in the output
@@ -179,11 +259,25 @@ int main() {
 	const std::string take = subst(env("RUNPOD_WEBHOOK_GET_JOB"), "$ID", worker);
 	const std::string done_tpl = subst(env("RUNPOD_WEBHOOK_POST_OUTPUT"), "$RUNPOD_POD_ID", worker);
 
+	// Before anything that could fail: the first record is the one worth having,
+	// and a log opened after the check cannot hold the check's own verdict.
+	static std::string logf = env("LOGF", "/runpod-volume/transport-runpod.ndjson");
+	LOGF = logf.empty() ? nullptr : logf.c_str();
+	emit("INFO", "c++ worker up, id=" + worker + ", log=" + logf, "worker.start");
+	emit("INFO", std::string("env: GET_JOB=") + (take.empty() ? "unset" : "set") +
+					" POST_OUTPUT=" + (done_tpl.empty() ? "unset" : "set") +
+					" PING=" + (env("RUNPOD_WEBHOOK_PING").empty() ? "unset" : "set") +
+					" API_KEY=" + (api_key.empty() ? "unset" : "set"),
+			"worker.env");
+
 	if (take.empty() || done_tpl.empty()) {
-		fprintf(stderr, "worker: RUNPOD_WEBHOOK_GET_JOB / _POST_OUTPUT unset -- not in a worker\n");
-		return 1;
+		emit("FATAL", "RUNPOD_WEBHOOK_GET_JOB / _POST_OUTPUT unset -- not in a worker", "worker.env");
+		// Not an exit: a container that dies takes the explanation with it, and
+		// this record is the explanation. Idle so the volume keeps it.
+		for (;;) {
+			std::this_thread::sleep_for(std::chrono::seconds(30));
+		}
 	}
-	fprintf(stderr, "worker: c++ worker up, id=%s\n", worker.c_str());
 
 	// The heartbeat, on its own thread and started before the first job-take.
 	//
@@ -200,7 +294,7 @@ int main() {
 				const Reply p = http_get(ping, api_key);
 				static long last = -1;
 				if (p.status != last) {
-					fprintf(stderr, "worker: ping -> %ld\n", p.status);
+					emit("INFO", "ping -> " + std::to_string(p.status), "worker.ping");
 					last = p.status;
 				}
 				std::this_thread::sleep_for(std::chrono::milliseconds(ping_ms > 0 ? ping_ms : 10000));
@@ -208,11 +302,27 @@ int main() {
 		});
 		heartbeat.detach();
 	} else {
-		fprintf(stderr, "worker: RUNPOD_WEBHOOK_PING unset, no heartbeat\n");
+		emit("WARN", "RUNPOD_WEBHOOK_PING unset, no heartbeat", "worker.ping");
 	}
 
+	long seen = -1;
+	long seen = -1;
 	for (;;) {
 		const Reply job = http_get(take + "&job_in_progress=0", api_key);
+		if (job.status != seen) {
+			// Every distinct status once, 204 included. A stuck queue with a ready
+			// worker is exactly the case where "no job" is the interesting answer.
+			emit("INFO", "job-take -> " + std::to_string(job.status) + " " + job.body.substr(0, 300),
+					"worker.take");
+			seen = job.status;
+		}
+		if (job.status != seen) {
+			// Every distinct status once, 204 included. A stuck queue with a ready
+			// worker is exactly the case where "no job" is the interesting answer.
+			emit("INFO", "job-take -> " + std::to_string(job.status) + " " + job.body.substr(0, 300),
+					"worker.take");
+			seen = job.status;
+		}
 
 		// 204 is "no job" and 400 is the same answer when FlashBoot is on.
 		// Neither is a failure, and a worker that logged them as one would fill
@@ -237,10 +347,10 @@ int main() {
 		const std::string id = json_string(job.body, "id");
 		const std::string input = json_value(job.body, "input");
 		if (id.empty()) {
-			fprintf(stderr, "worker: job with no id\n");
+			emit("ERROR", "job with no id: " + job.body.substr(0, 300), "worker.job");
 			continue;
 		}
-		fprintf(stderr, "worker: job %s\n", id.c_str());
+		emit("INFO", "job " + id, "worker.job");
 
 		// The handler seam. An interactor goes here: `weft_ask(in, command, ...)`
 		// with the reply base64'd into the output. Echo proves the wire.
@@ -249,6 +359,6 @@ int main() {
 
 		const std::string done = subst(done_tpl, "$ID", id) + "&isStream=false";
 		const Reply posted = http_post(done, "{\"output\":" + output + "}", id, api_key);
-		fprintf(stderr, "worker: posted %s -> %ld\n", id.c_str(), posted.status);
+		emit("INFO", "posted " + id + " -> " + std::to_string(posted.status), "worker.done");
 	}
 }
