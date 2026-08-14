@@ -306,16 +306,8 @@ int main() {
 	}
 
 	long seen = -1;
-	long seen = -1;
 	for (;;) {
 		const Reply job = http_get(take + "&job_in_progress=0", api_key);
-		if (job.status != seen) {
-			// Every distinct status once, 204 included. A stuck queue with a ready
-			// worker is exactly the case where "no job" is the interesting answer.
-			emit("INFO", "job-take -> " + std::to_string(job.status) + " " + job.body.substr(0, 300),
-					"worker.take");
-			seen = job.status;
-		}
 		if (job.status != seen) {
 			// Every distinct status once, 204 included. A stuck queue with a ready
 			// worker is exactly the case where "no job" is the interesting answer.
