@@ -47,11 +47,17 @@ struct Reply {
 	std::string body;
 };
 
-Reply http_get(const std::string &url) {
+Reply http_get(const std::string &url, const std::string &authorization = "") {
 	Reply r;
 	CURL *c = curl_easy_init();
 	if (!c) {
 		return r;
+	}
+	curl_slist *h = nullptr;
+	if (!authorization.empty()) {
+		const std::string a = "Authorization: " + authorization;
+		h = curl_slist_append(h, a.c_str());
+		curl_easy_setopt(c, CURLOPT_HTTPHEADER, h);
 	}
 	curl_easy_setopt(c, CURLOPT_URL, url.c_str());
 	curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, sink);
@@ -59,6 +65,9 @@ Reply http_get(const std::string &url) {
 	curl_easy_setopt(c, CURLOPT_TIMEOUT, 30L);
 	if (curl_easy_perform(c) == CURLE_OK) {
 		curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &r.status);
+	}
+	if (h) {
+		curl_slist_free_all(h);
 	}
 	curl_easy_cleanup(c);
 	return r;
@@ -166,6 +175,33 @@ int main() {
 	}
 	fprintf(stderr, "worker: c++ worker up, id=%s\n", worker.c_str());
 
+	// The heartbeat, on its own thread and started before the first job-take.
+	//
+	// The Python SDK starts its ping thread first and never explains why, so the
+	// ordering is copied rather than reasoned about: a worker that is only known
+	// to be alive by the job it has not taken yet is indistinguishable from one
+	// that has hung, and this is the only call that says otherwise.
+	const std::string ping = subst(env("RUNPOD_WEBHOOK_PING"), "$RUNPOD_POD_ID", worker);
+	const std::string api_key = env("RUNPOD_AI_API_KEY");
+	const long ping_ms = atol(env("RUNPOD_PING_INTERVAL", "10000").c_str());
+	std::thread heartbeat;
+	if (!ping.empty()) {
+		heartbeat = std::thread([ping, api_key, ping_ms] {
+			for (;;) {
+				const Reply p = http_get(ping, api_key);
+				static long last = -1;
+				if (p.status != last) {
+					fprintf(stderr, "worker: ping -> %ld\n", p.status);
+					last = p.status;
+				}
+				std::this_thread::sleep_for(std::chrono::milliseconds(ping_ms > 0 ? ping_ms : 10000));
+			}
+		});
+		heartbeat.detach();
+	} else {
+		fprintf(stderr, "worker: RUNPOD_WEBHOOK_PING unset, no heartbeat\n");
+	}
+
 	for (;;) {
 		const Reply job = http_get(take + "&job_in_progress=0");
 
@@ -181,7 +217,10 @@ int main() {
 			continue;
 		}
 		if (job.status != 200) {
-			fprintf(stderr, "worker: job-take %ld\n", job.status);
+			// The body is logged for unexpected statuses only. A worker that
+			// printed every 204 would bury the one response that explains a
+			// stuck queue, which is the failure this logging exists for.
+			fprintf(stderr, "worker: job-take %ld: %.200s\n", job.status, job.body.c_str());
 			std::this_thread::sleep_for(std::chrono::seconds(1));
 			continue;
 		}
