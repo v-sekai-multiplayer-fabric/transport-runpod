@@ -12,8 +12,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /src
 COPY CMakeLists.txt ./
+COPY include ./include
 COPY src ./src
-RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
+COPY third_party ./third_party
+RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j --target rp-worker-echo
 
 FROM ubuntu:24.04
 
@@ -25,9 +27,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libcurl4 ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=build /src/build/rp-worker /usr/local/bin/rp-worker
+COPY --from=build /src/build/rp-worker-echo /usr/local/bin/rp-worker-echo
 
 # Unbuffered stderr: RunPod collects worker logs, and a buffered worker that dies
 # mid-job takes its explanation with it.
-ENV PYTHONUNBUFFERED=
-CMD ["/usr/local/bin/rp-worker"]
+CMD ["/usr/local/bin/rp-worker-echo"]

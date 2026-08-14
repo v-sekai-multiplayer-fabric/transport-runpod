@@ -1,16 +1,17 @@
-// A RunPod Serverless worker, in C++.
+// The RunPod Serverless transport, as a library.
 //
 // RunPod ships client SDKs for Python, JavaScript and Go, and handler functions
 // for Python. There is no C++ worker, and the wire a worker speaks is not
 // documented -- what is here was derived from `runpod/runpod-python`
-// (`rp_job.py`, `rp_http.py`) and is what this proves.
+// (`rp_job.py`, `rp_http.py`) and proved against a real endpoint (see
+// README.md's job trace).
 //
-// This file is the protocol and nothing else. The handler it calls is a seam:
-// the echo below exists so the worker API can be proved before an interactor
-// with 14 GB of weights is attached to it, because those are two different
-// questions and answering them together answers neither.
+// `rp_worker_run` is the whole job loop, taking a `weft_interactor_t` instead of
+// hardcoding a handler, so an interactor links this file rather than forking it.
 //
 // SPDX-License-Identifier: Apache-2.0
+
+#include "runpod/worker.h"
 
 #include <curl/curl.h>
 
@@ -21,8 +22,14 @@
 #include <ctime>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace {
+
+// RunPod's own payload cap (30MB, both directions) is the honest ceiling for a
+// reply this transport can actually deliver; base64 costs another ~37% on top,
+// which the value below leaves room for.
+constexpr size_t RP_REPLY_MAX = 20u << 20;
 
 std::string env(const char *k, const char *fallback = "") {
 	const char *v = getenv(k);
@@ -34,16 +41,10 @@ std::string env(const char *k, const char *fallback = "") {
 // RunPod shows worker logs only in its web console: there is no logs path in the
 // REST API (checked against /v1/openapi.json, 23 paths) and GraphQL has no
 // `workers` field on Endpoint. A serverless worker also has no inbound HTTP, so
-// it cannot serve its own records the way a pod can.
-//
-// So it writes them to the network volume instead, and something with a proxy
-// hostname reads them from there. Same OTel NDJSON record shape as
-// `interactor-seethrough-ggml`'s `entrypoint.sh`, so one reader serves both.
-//
-// stderr keeps every line too: when the console *is* reachable that is still the
-// first place anyone looks, and a log that exists in only one place is a log that
-// is missing whenever that place is the unreachable one.
-const char *LOGF = nullptr;
+// it cannot serve its own records the way a pod can -- it writes them to the
+// network volume instead, in the same OTel NDJSON shape
+// `interactor-seethrough-ggml`'s `entrypoint.sh` uses, so one reader serves both.
+const char *g_logf = nullptr;
 
 int severity_number(const char *sev) {
 	if (!strcmp(sev, "DEBUG")) return 5;
@@ -66,7 +67,7 @@ std::string json_escape(const std::string &s) {
 		default:
 			if ((unsigned char)ch < 0x20) {
 				char b[8];
-				snprintf(b, sizeof b, "\\u%04x", ch);
+				snprintf(b, sizeof b, "\\u%04x", (unsigned char)ch);
 				o += b;
 			} else {
 				o += ch;
@@ -79,13 +80,12 @@ std::string json_escape(const std::string &s) {
 void emit(const char *sev, const std::string &body, const std::string &event = "") {
 	fprintf(stderr, "worker: %s\n", body.c_str());
 	fflush(stderr);
-	if (!LOGF) {
+	if (!g_logf) {
 		return;
 	}
-	// Opened and closed per record, and flushed: a worker that is killed between
-	// jobs still leaves every line it wrote, which is the whole point of writing
-	// them somewhere durable.
-	FILE *f = fopen(LOGF, "a");
+	// Opened and closed per record, and flushed: a worker killed between jobs
+	// still leaves every line it wrote.
+	FILE *f = fopen(g_logf, "a");
 	if (!f) {
 		return;
 	}
@@ -174,6 +174,9 @@ Reply http_post(const std::string &url, const std::string &body, const std::stri
 	curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE, (long)body.size());
 	curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, sink);
 	curl_easy_setopt(c, CURLOPT_WRITEDATA, &r.body);
+	// A `render`/`generate` job can run minutes, not seconds -- this is the
+	// heartbeat and the job-take/post calls, not the work itself, so it stays
+	// short; the interactor's own `ask` call has no curl timeout at all (below).
 	curl_easy_setopt(c, CURLOPT_TIMEOUT, 60L);
 	if (curl_easy_perform(c) == CURLE_OK) {
 		curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &r.status);
@@ -183,9 +186,10 @@ Reply http_post(const std::string &url, const std::string &body, const std::stri
 	return r;
 }
 
-// Enough JSON to find `"id"` and to lift `"input"` out whole. A parser is not
-// wanted here: `input` is handed on as the caller wrote it, so re-encoding it
-// through a model of JSON would only be a way to change it by accident.
+// Enough JSON to find a top-level string key and to lift a top-level value out
+// whole. A parser is not wanted here: `input` is handed to the interactor as the
+// caller wrote it, so re-encoding it through a model of JSON would only be a way
+// to change it by accident.
 std::string json_string(const std::string &s, const std::string &key) {
 	const std::string k = "\"" + key + "\"";
 	size_t at = s.find(k);
@@ -245,25 +249,53 @@ std::string json_value(const std::string &s, const std::string &key) {
 	return "";
 }
 
+// RFC 4648, no line wrapping -- CBOR bytes go into one JSON string field.
+std::string base64(const std::string &in) {
+	static const char T[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	std::string out;
+	out.reserve((in.size() + 2) / 3 * 4);
+	size_t i = 0;
+	for (; i + 2 < in.size(); i += 3) {
+		const unsigned v = ((unsigned char)in[i] << 16) | ((unsigned char)in[i + 1] << 8) |
+				(unsigned char)in[i + 2];
+		out += T[(v >> 18) & 0x3f];
+		out += T[(v >> 12) & 0x3f];
+		out += T[(v >> 6) & 0x3f];
+		out += T[v & 0x3f];
+	}
+	const size_t rem = in.size() - i;
+	if (rem == 1) {
+		const unsigned v = (unsigned char)in[i] << 16;
+		out += T[(v >> 18) & 0x3f];
+		out += T[(v >> 12) & 0x3f];
+		out += "==";
+	} else if (rem == 2) {
+		const unsigned v = ((unsigned char)in[i] << 16) | ((unsigned char)in[i + 1] << 8);
+		out += T[(v >> 18) & 0x3f];
+		out += T[(v >> 12) & 0x3f];
+		out += T[(v >> 6) & 0x3f];
+		out += "=";
+	}
+	return out;
+}
+
 } // namespace
 
-int main() {
+int rp_worker_run(weft_interactor_t in) {
 	curl_global_init(CURL_GLOBAL_DEFAULT);
 
 	const std::string worker = env("RUNPOD_POD_ID", "local");
 	// Every call a worker makes carries this, not just the ping: the Python SDK
 	// puts it on the session (`http_client.get_auth_header`), so job-take and the
-	// result post are authenticated too. A job-take without it is answered as
-	// though there were no work, which is indistinguishable from an idle queue.
+	// result post are authenticated too.
 	const std::string api_key = env("RUNPOD_AI_API_KEY");
 	const std::string take = subst(env("RUNPOD_WEBHOOK_GET_JOB"), "$ID", worker);
 	const std::string done_tpl = subst(env("RUNPOD_WEBHOOK_POST_OUTPUT"), "$RUNPOD_POD_ID", worker);
 
-	// Before anything that could fail: the first record is the one worth having,
-	// and a log opened after the check cannot hold the check's own verdict.
+	// Before anything that could fail: the first record is the one worth having.
 	static std::string logf = env("LOGF", "/runpod-volume/transport-runpod.ndjson");
-	LOGF = logf.empty() ? nullptr : logf.c_str();
-	emit("INFO", "c++ worker up, id=" + worker + ", log=" + logf, "worker.start");
+	g_logf = logf.empty() ? nullptr : logf.c_str();
+	emit("INFO", "worker up, id=" + worker + ", log=" + logf, "worker.start");
 	emit("INFO", std::string("env: GET_JOB=") + (take.empty() ? "unset" : "set") +
 					" POST_OUTPUT=" + (done_tpl.empty() ? "unset" : "set") +
 					" PING=" + (env("RUNPOD_WEBHOOK_PING").empty() ? "unset" : "set") +
@@ -272,24 +304,17 @@ int main() {
 
 	if (take.empty() || done_tpl.empty()) {
 		emit("FATAL", "RUNPOD_WEBHOOK_GET_JOB / _POST_OUTPUT unset -- not in a worker", "worker.env");
-		// Not an exit: a container that dies takes the explanation with it, and
-		// this record is the explanation. Idle so the volume keeps it.
-		for (;;) {
-			std::this_thread::sleep_for(std::chrono::seconds(30));
-		}
+		return 1;
 	}
 
-	// The heartbeat, on its own thread and started before the first job-take.
-	//
-	// The Python SDK starts its ping thread first and never explains why, so the
-	// ordering is copied rather than reasoned about: a worker that is only known
-	// to be alive by the job it has not taken yet is indistinguishable from one
-	// that has hung, and this is the only call that says otherwise.
+	// The heartbeat, on its own thread, started before the first job-take. The
+	// Python SDK does the same and never explains why; the ordering is copied
+	// rather than reasoned about, since a worker only known alive by the job it
+	// has not taken is indistinguishable from a hung one.
 	const std::string ping = subst(env("RUNPOD_WEBHOOK_PING"), "$RUNPOD_POD_ID", worker);
 	const long ping_ms = atol(env("RUNPOD_PING_INTERVAL", "10000").c_str());
-	std::thread heartbeat;
 	if (!ping.empty()) {
-		heartbeat = std::thread([ping, api_key, ping_ms] {
+		std::thread([ping, api_key, ping_ms] {
 			for (;;) {
 				const Reply p = http_get(ping, api_key);
 				static long last = -1;
@@ -299,8 +324,7 @@ int main() {
 				}
 				std::this_thread::sleep_for(std::chrono::milliseconds(ping_ms > 0 ? ping_ms : 10000));
 			}
-		});
-		heartbeat.detach();
+		}).detach();
 	} else {
 		emit("WARN", "RUNPOD_WEBHOOK_PING unset, no heartbeat", "worker.ping");
 	}
@@ -309,16 +333,13 @@ int main() {
 	for (;;) {
 		const Reply job = http_get(take + "&job_in_progress=0", api_key);
 		if (job.status != seen) {
-			// Every distinct status once, 204 included. A stuck queue with a ready
-			// worker is exactly the case where "no job" is the interesting answer.
+			// Every distinct status once, 204 included: a stuck queue with a
+			// ready worker is exactly the case where "no job" is interesting.
 			emit("INFO", "job-take -> " + std::to_string(job.status) + " " + job.body.substr(0, 300),
 					"worker.take");
 			seen = job.status;
 		}
 
-		// 204 is "no job" and 400 is the same answer when FlashBoot is on.
-		// Neither is a failure, and a worker that logged them as one would fill
-		// its log with the common case.
 		if (job.status == 204 || job.status == 400) {
 			std::this_thread::sleep_for(std::chrono::milliseconds(500));
 			continue;
@@ -328,26 +349,38 @@ int main() {
 			continue;
 		}
 		if (job.status != 200) {
-			// The body is logged for unexpected statuses only. A worker that
-			// printed every 204 would bury the one response that explains a
-			// stuck queue, which is the failure this logging exists for.
-			fprintf(stderr, "worker: job-take %ld: %.200s\n", job.status, job.body.c_str());
 			std::this_thread::sleep_for(std::chrono::seconds(1));
 			continue;
 		}
 
 		const std::string id = json_string(job.body, "id");
-		const std::string input = json_value(job.body, "input");
 		if (id.empty()) {
 			emit("ERROR", "job with no id: " + job.body.substr(0, 300), "worker.job");
 			continue;
 		}
 		emit("INFO", "job " + id, "worker.job");
 
-		// The handler seam. An interactor goes here: `weft_ask(in, command, ...)`
-		// with the reply base64'd into the output. Echo proves the wire.
-		const std::string output = "{\"language\":\"c++\",\"worker\":\"" + worker +
-				"\",\"echo\":" + (input.empty() ? "null" : input) + "}";
+		// The job's `input` is a JSON object; the contract wants one
+		// NUL-terminated command line. `input.command` is that line -- see
+		// README.md's "What a command is".
+		const std::string input_obj = json_value(job.body, "input");
+		const std::string command = json_string(input_obj, "command");
+
+		std::string output;
+		if (command.empty()) {
+			output = "{\"error\":\"input.command missing or empty\"}";
+		} else {
+			// One reply buffer, reused every job: an interactor answers "how many
+			// bytes" through `weft_ask`'s return value, and RunPod's 30MB payload
+			// cap means no reply this transport carries needs more than this.
+			static std::vector<unsigned char> buf(RP_REPLY_MAX);
+			int stop = 0;
+			const size_t n = weft_ask(&in, command.c_str(), buf.data(), buf.size(), &stop);
+			output = "{\"cbor\":\"" + base64(std::string((const char *)buf.data(), n)) + "\"}";
+			if (stop) {
+				emit("INFO", "interactor asked to stop", "worker.stop");
+			}
+		}
 
 		const std::string done = subst(done_tpl, "$ID", id) + "&isStream=false";
 		const Reply posted = http_post(done, "{\"output\":" + output + "}", id, api_key);

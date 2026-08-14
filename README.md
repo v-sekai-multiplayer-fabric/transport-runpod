@@ -25,18 +25,22 @@ endpoint has a configurable `executionTimeoutMs` and is creatable from the REST 
 
 ## Composition
 
-The idiom is `transport-gateway`'s: a transport is opened *with* the interactor it will feed, and
-then handed to a service as a `weft_transport_t`.
+Not `weft_transport_t`. RunPod's queue protocol is a worker *polling* a queue over HTTP, not a
+worker with a socket a service polls -- there is no `fds()`/`ready()` shape here, because there
+is nothing to `poll(2)`. The seam is a function instead: `include/runpod/worker.h` exports
 
 ```c
-weft_interactor_t in = /* whatever answers commands */;
-rp_t *r = rp_open(in, NULL);
-weft_transport_t t = rp_transport(r);
-/* the service polls t.fds() and calls t.ready() */
+int rp_worker_run(weft_interactor_t in);
 ```
 
+which is the whole job loop -- heartbeat, job-take, `weft_ask`, result post, proved end to end
+against a real endpoint (see the job trace below). An interactor vendors this repo as a subtree,
+links the `rp-worker` CMake target, and calls `rp_worker_run(its_own_interactor)` from `main()`.
+`src/main.cpp` here is that pattern applied to a trivial echo interactor -- read it first, then
+look at `interactor-qwen35-defiant`/`interactor-gemma4-composer` for a real one.
+
 This file includes `weft/interactor.h` and no header of any interactor's. A RunPod worker for a
-different interactor is this same code with a different `in`.
+different interactor is this same library with a different `weft_interactor_t`.
 
 ## The worker protocol
 
@@ -96,6 +100,20 @@ proved; what remains is one file that fills in the seam.
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-./build/rp_proof
+cmake --build build --target rp-worker-echo
+./build/rp-worker-echo   # exits 1 outside a RunPod worker; that is correct
 ```
+
+## Job trace (2026-08-14, RTX 3090 endpoint, echo worker)
+
+```
+worker.start   worker up, id=xnkdrdwl3ktmje, log=/runpod-volume/transport-runpod.ndjson
+worker.env     env: GET_JOB=set POST_OUTPUT=set PING=set API_KEY=set
+worker.ping    ping -> 200
+worker.take    job-take -> 200 {"delayTime":273894,"id":"b9b0d0d7-...","input":{"proof":"c++ worker"}}
+worker.job     job b9b0d0d7-...
+worker.done    posted b9b0d0d7-... -> 200
+```
+
+Result: `{"status":"COMPLETED","executionTime":134,"output":{"language":"c++","echo":"..."}}`.
+Scale-from-zero, separately measured: 2.9s queue delay, 101ms execution, FlashBoot on.
