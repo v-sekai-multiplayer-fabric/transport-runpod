@@ -1,0 +1,16 @@
+[project]
+name = "rp-bus"
+version = "0.1.0.dev1"
+description = "The RunPod Serverless transport layer, in Python, answering jobs over the weft command bus"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+# iceoryx2 is pinned to the version contract-bus transcribed its C ABI from: the two halves of
+# this bus are one decision, and a floating pin would move one of them on its own.
+dependencies = ["runpod>=1.7", "iceoryx2==0.9.3"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["rp_bus"]

@@ -1,0 +1,32 @@
+# The RunPod Serverless transport layer, in Python, as a base image.
+#
+# It carries the job loop and the bus client and no interactor, because it does not know which
+# one it will be in front of -- an interactor image starts FROM this and adds itself, which is
+# what keeps one copy of the transport across however many interactors get an endpoint.
+#
+# Nothing is compiled: iceoryx2 ships a manylinux wheel, and the pin matches the version
+# contract-bus transcribed its C ABI from. The two halves of this bus are one decision, so a
+# floating pin would move one of them on its own.
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1
+WORKDIR /app
+
+COPY python /app/transport
+COPY third_party/harness/python /app/harness
+
+RUN pip install --no-cache-dir "iceoryx2==0.9.3" "runpod>=1.7"
+
+ENV PYTHONPATH=/app/transport:/app/harness
+
+# The proof runs in the build, so no image is produced from a tree whose correlation or
+# job-result shape is broken. It needs no bus and no network, which is what lets it run here.
+RUN python /app/transport/proof/test_handler.py
+
+# iceoryx2 creates its shared memory under /tmp at start. An absent or read-only /tmp is the
+# failure that looks like "no service" with nothing else in the log to say why.
+RUN mkdir -p /tmp/iceoryx2
+
+# On its own this image is a worker with nothing to ask, which answers every job with a
+# deadline. An interactor image overrides the entrypoint with one that starts both.
+CMD ["python", "-m", "rp_bus"]
