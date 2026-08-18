@@ -1,0 +1,92 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "transport-runpod: the RunPod Serverless transport layer"
+abstract: >
+  A transport layer with no listening socket. A RunPod Serverless worker is a
+  client of its own endpoint, so this takes jobs from a queue over HTTP and hands
+  each one to an interactor as a command. Two workers come out of it: one whose
+  interactor is linked in, and one whose interactor is another process reached
+  over the iceoryx2 command bus. The queue protocol is undocumented by RunPod and
+  was read out of its Python SDK's source.
+authors:
+  - family-names: Lee
+    given-names: "K. S. Ernest (iFire)"
+    email: ernest.lee@chibifire.com
+    orcid: "https://orcid.org/0000-0003-4570-1436"
+version: 0.1.0-dev.1
+date-released: "2026-08-17"
+license: MIT
+repository-code: "https://github.com/v-sekai-multiplayer-fabric/transport-runpod"
+keywords:
+  - runpod
+  - serverless
+  - transport
+  - iceoryx2
+  - shared-memory
+
+# What this repository is built on: the contracts it vendors, the library its bus is, and the
+# source its protocol was read out of. Every entry is something it would not work without.
+references:
+
+  - type: software
+    title: "contract-command: a command in, reply bytes out, and nothing about how it arrived"
+    authors:
+      - family-names: Lee
+        given-names: "K. S. Ernest (iFire)"
+        orcid: "https://orcid.org/0000-0003-4570-1436"
+    year: 2026
+    url: "https://github.com/v-sekai-multiplayer-fabric/contract-command"
+    notes: >
+      Vendored as third_party/interactor. weft_interactor_t is the shape both
+      workers here supply, and weft/cbor.h writes the replies.
+
+  - type: software
+    title: "contract-bus: the weft plane harness, the iceoryx2 C ABI as a dlsym dispatch table"
+    authors:
+      - family-names: Lee
+        given-names: "K. S. Ernest (iFire)"
+        orcid: "https://orcid.org/0000-0003-4570-1436"
+    year: 2026
+    url: "https://github.com/v-sekai-multiplayer-fabric/contract-bus"
+    notes: >
+      Vendored as third_party/harness. weft/command.hpp decides the service
+      names, the weft::byte payload and the 8-byte request-id envelope that
+      include/runpod/bus_ask.h is the client half of; weft/limits.hpp decides the
+      128 KiB bound on one message. third_party/harness/python/weft_harness is
+      the same bus for the Python worker and belongs upstream in that repository.
+
+  - type: software
+    title: "iceoryx2: lock-free zero-copy inter-process communication"
+    authors:
+      - name: "Contributors to the Eclipse Foundation"
+    year: 2026
+    version: "0.9.3"
+    license: Apache-2.0
+    url: "https://github.com/eclipse-iceoryx/iceoryx2"
+    notes: >
+      The bus. Loaded by dlopen at start rather than linked, so nothing here has
+      it in its build graph; the Python worker uses its PyPI binding, pinned to
+      the same version the C ABI was transcribed from.
+
+  - type: software
+    title: "runpod-python: the RunPod SDK"
+    authors:
+      - name: "RunPod"
+    year: 2026
+    license: MIT
+    url: "https://github.com/runpod/runpod-python"
+    notes: >
+      RunPod documents its client SDKs and its handler functions, not the wire a
+      worker speaks. src/worker.cpp's protocol was read out of
+      runpod/serverless/modules/rp_job.py, rp_http.py and rp_ping.py, and is
+      observed rather than specified. python/ runs that SDK directly instead.
+
+  - type: software
+    title: "libcurl"
+    authors:
+      - family-names: Stenberg
+        given-names: Daniel
+    year: 2026
+    license: curl
+    url: "https://github.com/curl/curl"
+    notes: "What the C++ worker speaks the RunPod webhooks with."

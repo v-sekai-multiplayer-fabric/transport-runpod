@@ -1,8 +1,13 @@
 name: image
 
-# Builds the worker image and pushes it to GHCR. linux/amd64 only: a RunPod
+# Builds the worker images and pushes them to GHCR. linux/amd64 only: a RunPod
 # worker is amd64, and building an arm64 variant nobody pulls would double the
 # build for nothing.
+#
+# Two images, because an interactor image starts FROM one of them and adds
+# itself. That is what keeps one copy of the job loop across however many
+# interactors get an endpoint, and it is why both are published rather than only
+# the one this repository runs on its own.
 
 on:
   workflow_dispatch:
@@ -23,6 +28,18 @@ jobs:
     permissions:
       contents: read
       packages: write
+    strategy:
+      matrix:
+        include:
+          # The C++ workers: rp-worker-echo and rp-worker-bus. Its build runs
+          # proof/roundtrip.cpp, so no image comes out of a tree whose
+          # correlation is broken.
+          - dockerfile: Dockerfile
+            suffix: ""
+          # The Python worker, and the base an interactor written in Python
+          # starts from. Nothing is compiled: iceoryx2 ships a manylinux wheel.
+          - dockerfile: Containerfile.python
+            suffix: "-python"
     steps:
       - uses: actions/checkout@v4
 
@@ -39,7 +56,7 @@ jobs:
       - id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}${{ matrix.suffix }}
           tags: |
             type=ref,event=branch
             type=sha
@@ -47,6 +64,7 @@ jobs:
       - uses: docker/build-push-action@v6
         with:
           context: .
+          file: ${{ matrix.dockerfile }}
           platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
